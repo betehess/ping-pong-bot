@@ -11,8 +11,9 @@ import java.net.InetSocketAddress
 object Global extends GlobalSettings {
 
   val bot: IrcBot = new IrcBot {
-//    val remote = new InetSocketAddress("irc.w3.org", 6697)
+    //    val remote = new InetSocketAddress("irc.w3.org", 6697)
     val remote = new InetSocketAddress("irc.w3.org", 6667)
+//    val remote = new InetSocketAddress("www.w3.org", 443)
     val nick = Nick("pingpong")
     val name = "Ping Pong bot"
     def onEvent(ircClient: ActorRef) = {

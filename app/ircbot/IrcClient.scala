@@ -1,12 +1,15 @@
 package org.w3.ircbot
 
 import java.net.{ Socket, InetSocketAddress }
-import java.io.{ BufferedReader, PrintWriter, InputStreamReader, OutputStreamWriter }
+import java.io._
 import java.util.concurrent.{ Executors, Callable }
-import akka.io.{ IO, Tcp, TcpPipelineHandler, SslTlsSupport }
+import akka.io._
 import akka.util.ByteString
-
-import akka.actor._
+import akka.actor.{ IO => _, _ }
+import javax.net.ssl._
+import akka.event.NoLogging
+import javax.net.ssl._
+import java.security._
 
 /**
  * Companion object for IrcClient
@@ -28,6 +31,125 @@ object IrcClient {
   val CONNUPMSG_R = """^:([^ ]+) 001 ([^ ]+) :(.*)$""".r
   // :johann!johann@98.239.3.24 KICK #sico test :va t en
   val KICKMSG_R = """^:(\w+)!(.+?)@([^ ]+) KICK ([^ ]+) ([^ ]+) :(.*)$""".r
+
+
+  /**
+   * https://github.com/spray/spray/blob/master/spray-io-tests/src/test/scala/spray/io/SslTlsSupportSpec.scala
+   * http://publib.boulder.ibm.com/infocenter/javasdk/v6r0/index.jsp?topic=%2Fcom.ibm.java.security.component.doc%2Fsecurity-component%2Fjsse2Docs%2Fssltlsdata.html
+   */
+  def createSslEngine(remote: InetSocketAddress, keyStoreResource: String, password: String): SSLEngine = {
+    def createSslContext(keyStoreResource: String, password: String): SSLContext = {
+      val keyStore = KeyStore.getInstance("jks")
+      keyStore.load(new FileInputStream(keyStoreResource), password.toCharArray)
+      val keyManagerFactory = KeyManagerFactory.getInstance("SunX509")
+      keyManagerFactory.init(keyStore, password.toCharArray)
+      val trustManagerFactory = TrustManagerFactory.getInstance("SunX509")
+      trustManagerFactory.init(keyStore)
+      val context = SSLContext.getInstance("TLS")
+      context.init(keyManagerFactory.getKeyManagers, trustManagerFactory.getTrustManagers, new SecureRandom)
+      context
+    }
+    val context = createSslContext(keyStoreResource, password)
+    val engine = context.createSSLEngine(remote.getHostName, remote.getPort)
+    engine.setUseClientMode(true)
+    engine
+  }
+
+  // just for debugging purposes
+  val logger = new akka.event.LoggingAdapter {
+    val isDebugEnabled: Boolean = true
+    val isErrorEnabled: Boolean = true
+    val isInfoEnabled: Boolean = true
+    val isWarningEnabled: Boolean = true
+    protected def notifyDebug(message: String): Unit = println("1 "+message)
+    protected def notifyError(cause: Throwable,message: String): Unit = println("2 "+message)
+    protected def notifyError(message: String): Unit = println("3 "+message)
+    protected def notifyInfo(message: String): Unit = println("4 "+message)
+    protected def notifyWarning(message: String): Unit = println("5 "+message)
+  }
+
+}
+
+class AkkaSslHandler(init: TcpPipelineHandler.Init[TcpPipelineHandler.WithinActorContext, String, String], bot: IrcBot)
+extends Actor with ActorLogging {
+
+  import IrcClient._
+  import Tcp._
+  import context.system
+
+  var pipeline: ActorRef = _
+
+  def send(message: String): Unit = {
+    println(s">> $message")
+    pipeline ! init.Command(s"$message\r\n")
+  }
+
+  def receive = {
+
+    case p: ActorRef =>
+      println("got pipeline: " + p)
+      pipeline = p
+      // 
+      send(s"NICK ${bot.nick.nickname}")
+      send(s"USER ${bot.nick.nickname} 8 *  : ${bot.name}")
+      bot.onEvent(self)(org.w3.ircbot.Connected)
+
+    case CommandFailed(w: Write) => // O/S buffer was full
+
+    case _: ConnectionClosed =>
+      println("asked to close")
+      context.stop(self)
+
+    case init.Event(IrcEvent(event)) =>
+      // side-effects
+      event match {
+        case Disconnected =>
+          bot.onEvent(self)(Disconnected)
+          context.stop(self)
+
+        case PING(message) =>
+          send("PONG :" + message)
+
+        case _ => ()
+      }
+      // pass the event to the bot
+      bot.onEvent(self)(event)
+
+    // :irc.w3.org 353 spartabot = #spartacusse :spartabot johann betehess
+    case init.Event(m: String)  if (JOINMSG findFirstMatchIn m).isDefined =>
+      val hit = (JOINMSG findFirstMatchIn m).get
+      // TODO use regex here
+      val chunks = (m split " ").toList
+      val channel = Channel(hit.group(3))
+      val participants = (chunks drop 6) map (Nick(_))
+      bot.onEvent(self)(RPL_NAMREPLY(channel, participants))
+
+    case init.Event(m: String) if (CONNUPMSG_R findFirstMatchIn m).isDefined =>
+      val hit = (CONNUPMSG_R findFirstMatchIn m).get
+      val host = hit.group(1)
+      val nick = Nick(hit.group(2))
+      val message = hit.group(3)
+      bot.onEvent(self)(CONNUPMSG(host, nick, message))
+
+    case init.Event(m: String) if (KICKMSG_R findFirstMatchIn m).isDefined =>
+      val hit = (KICKMSG_R findFirstMatchIn m).get
+      val sender = User(Nick(hit.group(1)), Name(hit.group(2)), Host(hit.group(3)))
+      val nick = Nick(hit.group(5))
+      val channel = Channel(hit.group(4))
+      val reason = hit.group(6)
+      bot.onEvent(self)(KICKMSG(sender, channel, nick, reason))
+
+    case CmdQuit(reason) =>
+      send(s"QUIT :${reason}")
+      sender ! Close
+
+    case cmd: IrcCommand =>
+      send(cmd.toString)
+
+    case init.Event(foo) => println("^^ "+foo)
+
+  }
+
 }
 
 
@@ -36,117 +158,40 @@ object IrcClient {
   * see: http://oreilly.com/pub/h/1963
   * see: http://irchelp.org/irchelp/rfc/rfc.html
   */
-class IrcClient(bot: IrcBot) extends Actor {
+class IrcClient(bot: IrcBot) extends Actor with ActorLogging {
 
   import IrcClient._
   import Tcp._
   import context.system
 
-  // established the TCP connection
+  // establishes the TCP connection
   IO(Tcp) ! Connect(bot.remote)
-
-  // used as a buffer to store what's sent by the server
-  var bs: ByteString = ByteString.empty
-
-  /** extracts lines from  */
-  def readLines(): Iterable[String] = {
-    val builder = Iterable.newBuilder[String]
-    @annotation.tailrec
-    def getLines(): Unit = {
-      val index = bs.indexOf('\r')
-      if (index >= 0  &&  index < bs.size - 1  &&  bs(index + 1) == '\n') {
-        val line = bs.slice(0, index).utf8String
-        println(s"<< ${line}")
-        builder += line
-        bs = bs.drop(index + 2)
-        getLines()
-      } else ()
-    }
-    getLines()
-    builder.result()
-  }
 
   def receive = {
     case CommandFailed(_: Connect) =>
       context stop self
  
     case c @ Connected(remote, local) =>
-      val connection = sender
       // http://doc.akka.io/docs/akka/snapshot/scala/io-tcp.html
-//      val init = TcpPipelineHandler.props(
-//        new SslTlsSupport(sslEngine(remote, client = false)),
-//        connection,
-//        self
-//      )
-//      val pipeline = context.actorOf(init)
-      connection ! Register(self)
-      def send(message: String): Unit = {
-        println(s">> $message")
-        connection ! Write(ByteString(message + "\r\n"))
-      }
-      send(s"NICK ${bot.nick.nickname}")
-      send(s"USER ${bot.nick.nickname} 8 *  : ${bot.name}")
-      bot.onEvent(self)(org.w3.ircbot.Connected)
-      // the new "receive" function after connection is established
-      context become {
-        case CommandFailed(w: Write) => // O/S buffer was full
+      val sslEngine = createSslEngine(remote, "/etc/ssl/certs/java/cacerts", "changeit")
 
-        case Received(data) =>
-          //println("received" + data.utf8String)
-          bs = bs ++ data
-          readLines() foreach { line =>
-            self ! line
-          }
+      val init = TcpPipelineHandler.withLogger(
+        logger, // NoLogging,
+        new StringByteStringAdapter("utf-8") >>
+          new DelimiterFraming(maxSize = 1024, delimiter = ByteString("\r\n"), includeDelimiter = false) >>
+          new TcpReadWriteAdapter// >>
+//          new SslTlsSupport(sslEngine)
+      )
+      val connection = sender
 
-        case _: ConnectionClosed => context.stop(self)
+      val handler = context.actorOf(Props(classOf[AkkaSslHandler], init, bot))
+      val pipeline = context.actorOf(TcpPipelineHandler.props(
+        init, connection, handler))
+      connection ! Register(pipeline)
+      handler ! pipeline
 
-        case IrcEvent(event) =>
-          // side-effects
-          event match {
-            case Disconnected =>
-              bot.onEvent(self)(Disconnected)
-              context.stop(self)
+    case foo => println("@@ "+foo)
 
-            case PING(message) =>
-              send("PONG :" + message)
-
-            case _ => ()
-          }
-          // pass the event to the bot
-          bot.onEvent(self)(event)
-
-        // :irc.w3.org 353 spartabot = #spartacusse :spartabot johann betehess
-        case m: String  if (JOINMSG findFirstMatchIn m).isDefined =>
-          val hit = (JOINMSG findFirstMatchIn m).get
-          // TODO use regex here
-          val chunks = (m split " ").toList
-          val channel = Channel(hit.group(3))
-          val participants = (chunks drop 6) map (Nick(_))
-          bot.onEvent(self)(RPL_NAMREPLY(channel, participants))
-
-        case m: String if (CONNUPMSG_R findFirstMatchIn m).isDefined =>
-          val hit = (CONNUPMSG_R findFirstMatchIn m).get
-          val host = hit.group(1)
-          val nick = Nick(hit.group(2))
-          val message = hit.group(3)
-          bot.onEvent(self)(CONNUPMSG(host, nick, message))
-
-        case m: String if (KICKMSG_R findFirstMatchIn m).isDefined =>
-          val hit = (KICKMSG_R findFirstMatchIn m).get
-          val sender = User(Nick(hit.group(1)), Name(hit.group(2)), Host(hit.group(3)))
-          val nick = Nick(hit.group(5))
-          val channel = Channel(hit.group(4))
-          val reason = hit.group(6)
-          bot.onEvent(self)(KICKMSG(sender, channel, nick, reason))
-
-        case CmdQuit(reason) =>
-          send(s"QUIT :${reason}")
-          connection ! Close
-
-        case cmd: IrcCommand =>
-          send(cmd.toString)
-
-      }
   }
 
 }
